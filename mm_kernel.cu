@@ -8,6 +8,8 @@
 
 #include "cuda_matmul.h"
 
+#include <cublas_v2.h>
+
 __global__ void MatmulKernelV1(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -292,7 +294,92 @@ namespace V5 {
     }
 }
 
+namespace cuBlasImpl {
 
+    #include <type_traits>
+
+    // 将 cuBLAS 的列优先输出转成行优先
+    __global__ void TransposeFromCublasKernel(const scalar_t* __restrict__ cublas_out,
+                                              scalar_t* __restrict__ out,
+                                              uint32_t M, uint32_t P) {
+        uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; // row in [0..M)
+        uint32_t j = blockIdx.y * blockDim.y + threadIdx.y; // col in [0..P)
+        if (i < M && j < P) {
+            // cublas_out 存储的是 P x M 矩阵的列优先数据，目标是 M x P 行优先
+            out[i * P + j] = cublas_out[j + i * P];
+        }
+    }
+
+
+    void MatmulCoreV42(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
+        cublasHandle_t handle;
+        cublasStatus_t status = cublasCreate(&handle);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cublasCreate failed: %d\n", status);
+            return;
+        }
+
+        // 临时缓冲，cuBLAS 会把结果按 (m=P, n=M) 的列优先格式写入此缓冲区
+        scalar_t *cublas_out = nullptr;
+        cudaError_t cerr = cudaMalloc(&cublas_out, sizeof(scalar_t) * static_cast<size_t>(M) * static_cast<size_t>(P));
+        if (cerr != cudaSuccess) {
+            printf("cudaMalloc cublas_out failed: %d %s\n", cerr, cudaGetErrorString(cerr));
+            cublasDestroy(handle);
+            return;
+        }
+
+        const scalar_t alpha = static_cast<scalar_t>(1.0);
+        const scalar_t beta  = static_cast<scalar_t>(0.0);
+
+        if (std::is_same<scalar_t, float>::value) {
+            status = cublasSgemm(handle,
+                                 CUBLAS_OP_N, CUBLAS_OP_N,
+                                 static_cast<int>(P), static_cast<int>(M), static_cast<int>(N),
+                                 reinterpret_cast<const float*>(&alpha),
+                                 reinterpret_cast<const float*>(b), static_cast<int>(P),
+                                 reinterpret_cast<const float*>(a), static_cast<int>(N),
+                                 reinterpret_cast<const float*>(&beta),
+                                 reinterpret_cast<float*>(cublas_out), static_cast<int>(P));
+        } else if (std::is_same<scalar_t, double>::value) {
+            status = cublasDgemm(handle,
+                                 CUBLAS_OP_N, CUBLAS_OP_N,
+                                 static_cast<int>(P), static_cast<int>(M), static_cast<int>(N),
+                                 reinterpret_cast<const double*>(&alpha),
+                                 reinterpret_cast<const double*>(b), static_cast<int>(P),
+                                 reinterpret_cast<const double*>(a), static_cast<int>(N),
+                                 reinterpret_cast<const double*>(&beta),
+                                 reinterpret_cast<double*>(cublas_out), static_cast<int>(P));
+        } else {
+            printf("MatmulCoreV42: unsupported scalar_t\n");
+            cudaFree(cublas_out);
+            cublasDestroy(handle);
+            return;
+        }
+
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("cublasGemm failed: %d\n", status);
+            cudaFree(cublas_out);
+            cublasDestroy(handle);
+            return;
+        }
+
+        // 把 cublas_out (P x M, 列优先存储) 转成 out (M x P, 行优先)
+        // 确认结果正确之后，实际测实现性能时需要注释掉这一块
+        // constexpr int TX = 16;
+        // constexpr int TY = 16;
+        // dim3 block(TX, TY);
+        // dim3 grid((M + TX - 1) / TX, (P + TY - 1) / TY);
+        // TransposeFromCublasKernel<<<grid, block>>>(cublas_out, out, M, P);
+        //
+        // cudaError_t syncErr = cudaDeviceSynchronize();
+        // if (syncErr != cudaSuccess) {
+        //     printf("Transpose kernel failed: %d %s\n", syncErr, cudaGetErrorString(syncErr));
+        // }
+
+        cudaFree(cublas_out);
+        cublasDestroy(handle);
+    }
+}
 
 // Core的指针都是Device指针
 void MatmulCoreV1(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
@@ -357,6 +444,9 @@ std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t
             case 5:
                 MatmulCoreV5(cuda_a, cuda_b, cuda_out, M, N, P);
                 break;
+            case 42:
+                cuBlasImpl::MatmulCoreV42(cuda_a, cuda_b, cuda_out, M, N, P);
+                break;
             default:
                 assert(false);
         }
@@ -369,7 +459,6 @@ std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t
         ret.push_back((t1 - t0) * 1e-6);
     }
 
-    cudaMemcpy(out, cuda_out, sizeof(scalar_t) * M * P, cudaMemcpyDeviceToHost);
     cudaFree(cuda_a);
     cudaFree(cuda_b);
     cudaFree(cuda_out);

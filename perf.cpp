@@ -40,8 +40,8 @@ void reference_gemm(const float *A, const float *B, float *C, uint32_t M, uint32
 
 int main(int argc, char **argv) {
     // 默认参数
-    uint32_t M = 2048, N = 2048, P = 2048;
-    int repeats = 5;
+    uint32_t M = 4096, N = 4096, P = 4096;
+    int repeats = 10;
     int warmups = 1;
     unsigned int seed = 12345;
     int ver = 5;
