@@ -250,34 +250,34 @@ namespace V5 {
 
 
             // 计算OUT
-            // for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-            //     for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col++) {
-            //         for (uint32_t i = 0; i < K_STEP; i++) {
-            //             tmp[tile_row * TILE_COL_SIZE + tile_col] += As[asIdx(threadX * TILE_ROW_SIZE + tile_row, i)] * Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)];
-            //         }
-            //     }
-            // }
+            for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+                for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col++) {
+                    for (uint32_t i = 0; i < K_STEP; i++) {
+                        tmp[tile_row * TILE_COL_SIZE + tile_col] += As[asIdx(threadX * TILE_ROW_SIZE + tile_row, i)] * Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)];
+                    }
+                }
+            }
 
             // 这里经过优化，把SMEM访问次数从 TILE_ROW_SIZE * TILE_COL_SIZE * K_STEP
             // 变为了 K_STEP * (TILE_ROW_SIZE + TILE_COL_SIZE)
             // 能这么做的本质原因在于，计算OUT中的元素时，是存在复用的，比如(0, 0)和(0, 1)会共用As的第0行
             // 这里巧妙构造之后将这个复用实现了
             // 但是我这边实测下来，下面这个实现比上面的要慢接近50%
-            for (uint32_t i = 0; i < K_STEP; i++) {
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-                    a_reg[tile_row] = As[asIdx(threadX * TILE_ROW_SIZE + tile_row, i)];
-                }
-
-                for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
-                    b_reg[tile_col] = Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)];
-                }
-
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-                    for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
-                        tmp[tile_row * TILE_COL_SIZE + tile_col] += a_reg[tile_row] * b_reg[tile_col];
-                    }
-                }
-            }
+            // for (uint32_t i = 0; i < K_STEP; i++) {
+            //     for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+            //         a_reg[tile_row] = As[asIdx(threadX * TILE_ROW_SIZE + tile_row, i)];
+            //     }
+            //
+            //     for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col++) {
+            //         b_reg[tile_col] = Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)];
+            //     }
+            //
+            //     for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+            //         for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
+            //             tmp[tile_row * TILE_COL_SIZE + tile_col] += a_reg[tile_row] * b_reg[tile_col];
+            //         }
+            //     }
+            // }
 
 
             __syncthreads();
