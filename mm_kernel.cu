@@ -232,6 +232,7 @@ namespace V5 {
         for (uint32_t k = 0; k < N; k += K_STEP) {
             // 当前线程数量小于SMEM Size,需要用一层循环来加载
             // 这里要小心Bank Conflict
+            // 但是本身目标内存区域As和Bs也是不连续的，怎么防止Bank Conflict还需要仔细研究一下
             for (uint32_t i = 0; i < strideA; i++) {
                 const uint32_t loadIndex = i * totalThreadNum + threadIdx.x;
                 const uint32_t loadX = loadIndex / K_STEP;
@@ -292,6 +293,236 @@ namespace V5 {
             }
         }
     }
+}
+
+namespace V6 {
+    constexpr uint32_t ROW_BLOCK_SIZE = 128;
+    constexpr uint32_t COL_BLOCK_SIZE = 128;
+    constexpr uint32_t K_STEP = 8;
+    constexpr uint32_t TILE_ROW_SIZE = 8;
+    constexpr uint32_t TILE_COL_SIZE = 8;
+
+    __device__ inline uint32_t idx(uint32_t x, uint32_t y, uint32_t row_num, uint32_t col_num) {
+        return x * col_num + y;
+    }
+
+    __global__ void MatmulKernelV6(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
+        // 每个线程计算OUT的 TILE_ROW_SIZE * TILE_ROW_SIZE 个值
+        // 一共启动 (ROW_BLOCK_SIZE / TILE_ROW_SIZE) * (COL_BLOCK_SIZE / TILE_COL_SIZE) 个线程
+        const uint32_t outTopLeftX = blockIdx.x * ROW_BLOCK_SIZE;
+        const uint32_t outTopLeftY = blockIdx.y * COL_BLOCK_SIZE;
+        const uint32_t threadX = threadIdx.x / (COL_BLOCK_SIZE / TILE_COL_SIZE);
+        const uint32_t threadY = threadIdx.x % (COL_BLOCK_SIZE / TILE_COL_SIZE);
+
+        if ((outTopLeftX + threadX) >= M || (outTopLeftY + threadY) >= P) {
+            return;
+        }
+
+        // 这个线程需要计算的小OUT块的左上角坐标
+        const uint32_t threadOutTopLeftX = outTopLeftX + threadX * TILE_ROW_SIZE;
+        const uint32_t threadOutTopLeftY = outTopLeftY + threadY * TILE_COL_SIZE;
+
+        // 用lambda表达式计算二维坐标对应的下标
+        const auto aIdx = [M, N](uint32_t x, uint32_t y) {
+            return idx(x, y, M, N);
+        };
+        const auto bIdx = [N, P](uint32_t x, uint32_t y) {
+            return idx(x, y, N, P);
+        };
+        const auto outIdx = [M, P](uint32_t x, uint32_t y) {
+            return idx(x, y, M, P);
+        };
+        const auto asIdx = [](uint32_t x, uint32_t y) {
+            return idx(x, y, ROW_BLOCK_SIZE, K_STEP);
+        };
+        const auto bsIdx = [](uint32_t x, uint32_t y) {
+            return idx(x, y, K_STEP, COL_BLOCK_SIZE);
+        };
+
+        // 每个Block计算 ROW_BLOCK_SIZE * COL_BLOCK_SIZE 个OUT
+        // 其中每个线程计算 TILE_ROW_SIZE * TILE_COL_SIZE 个OUT
+        __shared__ scalar_t As[ROW_BLOCK_SIZE * K_STEP];
+        __shared__ scalar_t Bs[K_STEP * COL_BLOCK_SIZE];
+
+        constexpr uint32_t totalThreadNum = (ROW_BLOCK_SIZE / TILE_ROW_SIZE) * (COL_BLOCK_SIZE / TILE_COL_SIZE);
+        constexpr uint32_t strideA = (ROW_BLOCK_SIZE * K_STEP) / totalThreadNum;
+        constexpr uint32_t strideB = (K_STEP * COL_BLOCK_SIZE) / totalThreadNum;
+
+        scalar_t tmp[TILE_ROW_SIZE * TILE_COL_SIZE] = {0.0f};
+        scalar_t a_reg[TILE_ROW_SIZE];
+        scalar_t b_reg[TILE_COL_SIZE];
+
+        for (uint32_t k = 0; k < N; k += K_STEP) {
+            // 使用float4向量化加载必须确保每个线程处理4个元素的加载
+            assert(strideA == 4);
+            assert(strideB == 4);
+
+            // 不对As做转置的版本
+            // 要求K_STEP必须是4对齐的
+            assert((K_STEP & 3) == 0);
+            // 计算该线程要加载的元素在As的起始位置
+            const uint32_t as_load_x = threadIdx.x / (K_STEP / 4);
+            const uint32_t as_load_y = (threadIdx.x % (K_STEP / 4)) * 4;
+            // 计算A要加载的部分在整个A数组的坐标
+            const uint32_t a_load_x = outTopLeftX + as_load_x;
+            const uint32_t a_load_y = as_load_y + k;
+            reinterpret_cast<float4 *>(&As[asIdx(as_load_x, as_load_y)])[0] =
+                reinterpret_cast<const float4 *>(&a[aIdx(a_load_x, a_load_y)])[0];
+
+            // 加载Bs，同理
+            // 要求COL_BLOCK_SIZE必须是4对齐的，这样才能一个线程加载一行不出错
+            assert((COL_BLOCK_SIZE & 3) == 0);
+            const uint32_t bs_load_x = threadIdx.x / (COL_BLOCK_SIZE / 4);
+            const uint32_t bs_load_y = (threadIdx.x % (COL_BLOCK_SIZE / 4)) * 4;
+            const uint32_t b_load_x = k + bs_load_x;
+            const uint32_t b_load_y = outTopLeftY + bs_load_y;
+            reinterpret_cast<float4 *>(&Bs[bsIdx(bs_load_x, bs_load_y)])[0] =
+                reinterpret_cast<const float4 *>(&b[bIdx(b_load_x, b_load_y)])[0];
+
+            __syncthreads();
+
+            // 计算OUT
+            for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+                for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col++) {
+                    for (uint32_t i = 0; i < K_STEP; i++) {
+                        tmp[tile_row * TILE_COL_SIZE + tile_col] += As[asIdx(threadX * TILE_ROW_SIZE + tile_row, i)] * Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)];
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
+
+        // 写回结果
+        // 这里同样可以向量化
+        assert((TILE_COL_SIZE & 3) == 0);
+        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+            for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
+                reinterpret_cast<float4 *>(&out[outIdx(threadOutTopLeftX + tile_row, threadOutTopLeftY + tile_col)])[0] =
+                    reinterpret_cast<float4 *>(&tmp[tile_row * TILE_COL_SIZE + tile_col])[0];
+            }
+        }
+    }
+
+    __global__ void MatmulKernelV6Transpose(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
+        // 每个线程计算OUT的 TILE_ROW_SIZE * TILE_ROW_SIZE 个值
+        // 一共启动 (ROW_BLOCK_SIZE / TILE_ROW_SIZE) * (COL_BLOCK_SIZE / TILE_COL_SIZE) 个线程
+        const uint32_t outTopLeftX = blockIdx.x * ROW_BLOCK_SIZE;
+        const uint32_t outTopLeftY = blockIdx.y * COL_BLOCK_SIZE;
+        const uint32_t threadX = threadIdx.x / (COL_BLOCK_SIZE / TILE_COL_SIZE);
+        const uint32_t threadY = threadIdx.x % (COL_BLOCK_SIZE / TILE_COL_SIZE);
+
+        if ((outTopLeftX + threadX) >= M || (outTopLeftY + threadY) >= P) {
+            return;
+        }
+
+        // 这个线程需要计算的小OUT块的左上角坐标
+        const uint32_t threadOutTopLeftX = outTopLeftX + threadX * TILE_ROW_SIZE;
+        const uint32_t threadOutTopLeftY = outTopLeftY + threadY * TILE_COL_SIZE;
+
+        // 用lambda表达式计算二维坐标对应的下标
+        const auto aIdx = [M, N](uint32_t x, uint32_t y) {
+            return idx(x, y, M, N);
+        };
+        const auto bIdx = [N, P](uint32_t x, uint32_t y) {
+            return idx(x, y, N, P);
+        };
+        const auto outIdx = [M, P](uint32_t x, uint32_t y) {
+            return idx(x, y, M, P);
+        };
+        const auto asIdxTranspose = [](uint32_t x, uint32_t y) {
+            return idx(x, y, K_STEP, ROW_BLOCK_SIZE);
+        };
+        const auto bsIdx = [](uint32_t x, uint32_t y) {
+            return idx(x, y, K_STEP, COL_BLOCK_SIZE);
+        };
+
+        // 每个Block计算 ROW_BLOCK_SIZE * COL_BLOCK_SIZE 个OUT
+        // 其中每个线程计算 TILE_ROW_SIZE * TILE_COL_SIZE 个OUT
+        __shared__ scalar_t As[ROW_BLOCK_SIZE * K_STEP];
+        __shared__ scalar_t Bs[K_STEP * COL_BLOCK_SIZE];
+
+        constexpr uint32_t totalThreadNum = (ROW_BLOCK_SIZE / TILE_ROW_SIZE) * (COL_BLOCK_SIZE / TILE_COL_SIZE);
+        constexpr uint32_t strideA = (ROW_BLOCK_SIZE * K_STEP) / totalThreadNum;
+        constexpr uint32_t strideB = (K_STEP * COL_BLOCK_SIZE) / totalThreadNum;
+
+        scalar_t tmp[TILE_ROW_SIZE * TILE_COL_SIZE] = {0.0f};
+        scalar_t a_reg[TILE_ROW_SIZE];
+        scalar_t b_reg[TILE_COL_SIZE];
+
+        for (uint32_t k = 0; k < N; k += K_STEP) {
+            // 使用float4向量化加载必须确保每个线程处理4个元素的加载
+            assert(strideA == 4);
+            assert(strideB == 4);
+
+            // 不对As做转置的版本
+            // 要求K_STEP必须是4对齐的
+            assert((K_STEP & 3) == 0);
+            // 计算该线程要加载的元素在As的起始位置
+            const uint32_t as_load_x = threadIdx.x / (K_STEP / 4);
+            const uint32_t as_load_y = (threadIdx.x % (K_STEP / 4)) * 4;
+            // 计算A要加载的部分在整个A数组的坐标
+            const uint32_t a_load_x = outTopLeftX + as_load_x;
+            const uint32_t a_load_y = as_load_y + k;
+            // 转置加载到As
+            auto *a_tmp = reinterpret_cast<const float4 *>(&a[aIdx(a_load_x, a_load_y)]);
+            As[asIdxTranspose(as_load_y + 0, as_load_x)] = a_tmp->x;
+            As[asIdxTranspose(as_load_y + 1, as_load_x)] = a_tmp->y;
+            As[asIdxTranspose(as_load_y + 2, as_load_x)] = a_tmp->z;
+            As[asIdxTranspose(as_load_y + 3, as_load_x)] = a_tmp->w;
+
+            // 加载Bs，同理
+            // 要求COL_BLOCK_SIZE必须是4对齐的，这样才能一个线程加载一行不出错
+            assert((COL_BLOCK_SIZE & 3) == 0);
+            const uint32_t bs_load_x = threadIdx.x / (COL_BLOCK_SIZE / 4);
+            const uint32_t bs_load_y = (threadIdx.x % (COL_BLOCK_SIZE / 4)) * 4;
+            const uint32_t b_load_x = k + bs_load_x;
+            const uint32_t b_load_y = outTopLeftY + bs_load_y;
+            reinterpret_cast<float4 *>(&Bs[bsIdx(bs_load_x, bs_load_y)])[0] =
+                reinterpret_cast<const float4 *>(&b[bIdx(b_load_x, b_load_y)])[0];
+
+            __syncthreads();
+
+            // 使用V5里提到的优化方法，提前把数据加载到reg里，减少SMEM的访问
+            // 这里As转置后，可以向量化地提取，可以进一步提升性能
+            // 但是这个实现还是比原版V6慢，不理解为什么
+            for (uint32_t i = 0; i < K_STEP; i++) {
+                // 这里会向量化加载a_reg，所以要求其长度4对齐
+                assert((TILE_ROW_SIZE & 3) == 0);
+                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row += 4) {
+                    reinterpret_cast<float4 *>(&a_reg[tile_row])[0] =
+                        reinterpret_cast<float4 *>(&As[asIdxTranspose(i, threadX * TILE_ROW_SIZE + tile_row)])[0];
+                }
+
+                // 同理，向量化加载b_reg
+                assert((TILE_COL_SIZE & 3) == 0);
+                for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
+                    reinterpret_cast<float4 *>(&b_reg[tile_col])[0] =
+                        reinterpret_cast<float4 *>(&Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)])[0];
+                }
+
+                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+                    for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
+                        tmp[tile_row * TILE_COL_SIZE + tile_col] += a_reg[tile_row] * b_reg[tile_col];
+                    }
+                }
+            }
+
+
+            __syncthreads();
+        }
+
+        // 写回结果
+        // 这里同样可以向量化
+        assert((TILE_COL_SIZE & 3) == 0);
+        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+            for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
+                reinterpret_cast<float4 *>(&out[outIdx(threadOutTopLeftX + tile_row, threadOutTopLeftY + tile_col)])[0] =
+                    reinterpret_cast<float4 *>(&tmp[tile_row * TILE_COL_SIZE + tile_col])[0];
+            }
+        }
+    }
+
 }
 
 namespace cuBlasImpl {
@@ -412,6 +643,12 @@ void MatmulCoreV5(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t 
     V5::MatmulKernelV5<<<grid, block>>>(a, b, out, M, N, P);
 }
 
+void MatmulCoreV6(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
+    dim3 grid(std::ceil(static_cast<double>(M) / (V6::ROW_BLOCK_SIZE)), std::ceil(static_cast<double>(P) / V6::COL_BLOCK_SIZE));
+    dim3 block((V6::ROW_BLOCK_SIZE / V6::TILE_ROW_SIZE) * (V6::COL_BLOCK_SIZE / V6::TILE_COL_SIZE));
+    V6::MatmulKernelV6<<<grid, block>>>(a, b, out, M, N, P);
+}
+
 // 这里传的是Host指针
 std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P, uint32_t repeat_num, uint32_t ver) {
     scalar_t *cuda_a, *cuda_b, *cuda_out;
@@ -426,7 +663,7 @@ std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t
     std::vector<double> ret;
     ret.reserve(repeat_num);
     for (int i = 0; i < repeat_num; i++) {
-        cudaMemset(cuda_out, 0, sizeof(scalar_t) * M * P);
+        // cudaMemset(cuda_out, 0, sizeof(scalar_t) * M * P);
         uint64_t t0 = now_ns();
         switch (ver) {
             case 1:
@@ -444,12 +681,22 @@ std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t
             case 5:
                 MatmulCoreV5(cuda_a, cuda_b, cuda_out, M, N, P);
                 break;
+            case 6:
+                MatmulCoreV6(cuda_a, cuda_b, cuda_out, M, N, P);
+                break;
             case 42:
                 cuBlasImpl::MatmulCoreV42(cuda_a, cuda_b, cuda_out, M, N, P);
                 break;
             default:
                 assert(false);
         }
+
+        cudaError_t lastErr = cudaPeekAtLastError();
+        if (lastErr != cudaSuccess) {
+            printf("Cuda Last Err %d %s\n", lastErr, cudaGetErrorString(lastErr));
+        }
+        assert(lastErr == cudaSuccess);
+
         cudaError_t err = cudaDeviceSynchronize();
         printf("Cuda Return %d %s\n", err, cudaGetErrorString(err));
 
@@ -459,6 +706,7 @@ std::vector<double> MatmulProfile(const scalar_t *a, const scalar_t *b, scalar_t
         ret.push_back((t1 - t0) * 1e-6);
     }
 
+    cudaMemcpy(out, cuda_out, sizeof(scalar_t) * M * P, cudaMemcpyDeviceToHost);
     cudaFree(cuda_a);
     cudaFree(cuda_b);
     cudaFree(cuda_out);

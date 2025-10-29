@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     int repeats = 10;
     int warmups = 1;
     unsigned int seed = 12345;
-    int ver = 5;
+    int ver = 6;
 
     // 简单命令行解析： bench M N P [repeats]
     if (argc >= 4) {

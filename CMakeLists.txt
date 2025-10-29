@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.5)
 project(cuda_perf_test CXX CUDA)
 
+if(POLICY CMP0104)
+    cmake_policy(SET CMP0104 NEW)
+endif()
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES 50 CACHE STRING "CUDA architectures (e.g. 75;80;86)")
+    message(STATUS "CMAKE_CUDA_ARCHITECTURES not set, defaulting to \${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
 find_package(CUDA REQUIRED)
 include_directories(${CUDA_INCLUDE_DIRS})
 
