@@ -10,6 +10,8 @@
 
 #include <cublas_v2.h>
 
+#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+
 __global__ void MatmulKernelV1(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
     uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -525,8 +527,6 @@ namespace V6 {
 }
 
 namespace V6_Author {
-    #define CEIL_DIV(M, N) ((M) + (N)-1) / (N)
-
     __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
                                    float *B, float beta, float *C) {
       const int BM = 128;
@@ -677,136 +677,6 @@ namespace V10 {
         // 每个线程计算OUT的 TILE_ROW_SIZE * TILE_ROW_SIZE 个值
         const uint32_t outTopLeftX = blockIdx.x * ROW_BLOCK_SIZE;
         const uint32_t outTopLeftY = blockIdx.y * COL_BLOCK_SIZE;
-        const uint32_t threadX = threadIdx.x / (COL_BLOCK_SIZE / TILE_COL_SIZE);
-        const uint32_t threadY = threadIdx.x % (COL_BLOCK_SIZE / TILE_COL_SIZE);
-
-        if ((outTopLeftX + threadX) >= M || (outTopLeftY + threadY) >= P) {
-            return;
-        }
-
-        // 这个线程需要计算的小OUT块的左上角坐标
-        const uint32_t threadOutTopLeftX = outTopLeftX + threadX * TILE_ROW_SIZE;
-        const uint32_t threadOutTopLeftY = outTopLeftY + threadY * TILE_COL_SIZE;
-
-        // 用lambda表达式计算二维坐标对应的下标
-        const auto aIdx = [M, N](uint32_t x, uint32_t y) {
-            return idx(x, y, M, N);
-        };
-        const auto bIdx = [N, P](uint32_t x, uint32_t y) {
-            return idx(x, y, N, P);
-        };
-        const auto outIdx = [M, P](uint32_t x, uint32_t y) {
-            return idx(x, y, M, P);
-        };
-        const auto asIdxTranspose = [](uint32_t x, uint32_t y) {
-            return idx(x, y, K_STEP, ROW_BLOCK_SIZE);
-        };
-        const auto bsIdx = [](uint32_t x, uint32_t y) {
-            return idx(x, y, K_STEP, COL_BLOCK_SIZE);
-        };
-
-        // 每个Block计算 ROW_BLOCK_SIZE * COL_BLOCK_SIZE 个OUT
-        // 其中每个线程计算 TILE_ROW_SIZE * TILE_COL_SIZE 个OUT
-        __shared__ scalar_t As[ROW_BLOCK_SIZE * K_STEP];
-        __shared__ scalar_t Bs[K_STEP * COL_BLOCK_SIZE];
-
-        constexpr uint32_t strideA = (ROW_BLOCK_SIZE * K_STEP) / THREAD_NUM_PER_BLOCK;
-        constexpr uint32_t strideB = (K_STEP * COL_BLOCK_SIZE) / THREAD_NUM_PER_BLOCK;
-
-        scalar_t tmp[TILE_ROW_SIZE * TILE_COL_SIZE] = {0.0f};
-        scalar_t a_reg[TILE_ROW_SIZE];
-        scalar_t b_reg[TILE_COL_SIZE];
-        for (uint32_t k = 0; k < N; k += K_STEP) {
-            // 使用float4向量化加载必须确保每个线程处理的元素个数是4对齐的
-            // 这里会直接在编译阶段展开，所以放for循环里问题不大
-            assert((strideA & 3) == 0);
-            assert((strideB & 3) == 0);
-
-            // As里，从 as_start_load_index 开始，向后加载 strideA 个元素
-            const uint32_t as_start_load_index = threadIdx.x * strideA;
-            for (uint32_t i = 0; i < strideA; i += 4) {
-                // 这个循环里，从 as_current_start_load_index 向后加载4个元素
-                const uint32_t as_current_start_load_index = as_start_load_index + i;
-
-                // 首先计算当前元素在As里的坐标
-                // 这里As的形状是 ROW_BLOCK_SIZE * K_STEP
-                // 需要保证K_STEP是4对齐的
-                assert((K_STEP & 3) == 0);
-                const uint32_t as_load_x = as_current_start_load_index / K_STEP;
-                const uint32_t as_load_y = as_current_start_load_index % K_STEP;
-
-                // 把这个坐标映射到A上
-                const uint32_t a_x = outTopLeftX + as_load_x;
-                const uint32_t a_y = k + as_load_y;
-
-                // 使用向量化复制
-                // 并且要转置
-                auto a_tmp = reinterpret_cast<const float4 *>(&a[aIdx(a_x, a_y)]);
-                As[asIdxTranspose(as_load_y + 0, as_load_x)] = a_tmp->x;
-                As[asIdxTranspose(as_load_y + 1, as_load_x)] = a_tmp->y;
-                As[asIdxTranspose(as_load_y + 2, as_load_x)] = a_tmp->z;
-                As[asIdxTranspose(as_load_y + 3, as_load_x)] = a_tmp->w;
-            }
-
-            // 加载Bs，同理
-            const uint32_t bs_start_load_index = threadIdx.x * strideB;
-            for (uint32_t i = 0; i < strideB; i += 4) {
-                const uint32_t bs_current_start_load_index = bs_start_load_index + i;
-
-                assert((COL_BLOCK_SIZE & 3) == 0);
-                const uint32_t bs_load_x = bs_current_start_load_index / COL_BLOCK_SIZE;
-                const uint32_t bs_load_y = bs_current_start_load_index % COL_BLOCK_SIZE;
-
-                const uint32_t b_x = bs_load_x + k;
-                const uint32_t b_y = outTopLeftY + bs_load_y;
-
-                reinterpret_cast<float4 *>(&Bs[bsIdx(bs_load_x, bs_load_y)])[0] =
-                    reinterpret_cast<const float4 *>(&b[bIdx(b_x, b_y)])[0];
-            }
-
-            __syncthreads();
-
-            for (uint32_t i = 0; i < K_STEP; i++) {
-                // 这里会向量化加载a_reg，所以要求其长度4对齐
-                assert((TILE_ROW_SIZE & 3) == 0);
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row += 4) {
-                    reinterpret_cast<float4 *>(&a_reg[tile_row])[0] =
-                        reinterpret_cast<float4 *>(&As[asIdxTranspose(i, threadX * TILE_ROW_SIZE + tile_row)])[0];
-                }
-
-                // 同理，向量化加载b_reg
-                assert((TILE_COL_SIZE & 3) == 0);
-                for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
-                    reinterpret_cast<float4 *>(&b_reg[tile_col])[0] =
-                        reinterpret_cast<float4 *>(&Bs[bsIdx(i, threadY * TILE_COL_SIZE + tile_col)])[0];
-                }
-
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-                    for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
-                        tmp[tile_row * TILE_COL_SIZE + tile_col] += a_reg[tile_row] * b_reg[tile_col];
-                    }
-                }
-            }
-
-            __syncthreads();
-        }
-
-        // 写回结果
-        // 这里同样可以向量化
-        assert((TILE_COL_SIZE & 3) == 0);
-        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-            for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
-                reinterpret_cast<float4 *>(&out[outIdx(threadOutTopLeftX + tile_row, threadOutTopLeftY + tile_col)])[0] =
-                    reinterpret_cast<float4 *>(&tmp[tile_row * TILE_COL_SIZE + tile_col])[0];
-            }
-        }
-    }
-
-
-    __global__ void MatmulKernelV10Opt(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
-        // 每个线程计算OUT的 TILE_ROW_SIZE * TILE_ROW_SIZE 个值
-        const uint32_t outTopLeftX = blockIdx.x * ROW_BLOCK_SIZE;
-        const uint32_t outTopLeftY = blockIdx.y * COL_BLOCK_SIZE;
 
         // FIXME 这里判断条件要加上
         // const uint32_t threadX = threadIdx.x / (COL_BLOCK_SIZE / TILE_COL_SIZE);
@@ -950,7 +820,6 @@ namespace V10 {
 
 // 文章作者实现的V10版本
 namespace V10_Author {
-    #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
     const int WARPSIZE = 32; // warpSize is not constexpr
 
     /*
@@ -1241,7 +1110,7 @@ void MatmulCoreV6_Author(const scalar_t *a, const scalar_t *b, scalar_t *out, ui
 void MatmulCoreV10(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
     dim3 grid(std::ceil(static_cast<double>(M) / (V10::ROW_BLOCK_SIZE)), std::ceil(static_cast<double>(P) / V10::COL_BLOCK_SIZE));
     dim3 block(V10::THREAD_NUM_PER_BLOCK);
-    V10::MatmulKernelV10Opt<<<grid, block>>>(a, b, out, M, N, P);
+    V10::MatmulKernelV10<<<grid, block>>>(a, b, out, M, N, P);
 }
 
 void MatmulCoreV10_Author(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
