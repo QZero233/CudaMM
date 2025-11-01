@@ -34,6 +34,14 @@ __global__ void MatmulKernelV2(const scalar_t *a, const scalar_t *b, scalar_t *o
     const uint32_t x = blockIdx.x * BLOCK_SIZE + threadIdx.x / BLOCK_SIZE;
     const uint32_t y = blockIdx.y * BLOCK_SIZE + threadIdx.x % BLOCK_SIZE;
 
+    /*
+        还有另一种实现方式：
+        uint32_t y = blockIdx.x * blockDim.x + threadIdx.x;
+        uint32_t x = blockIdx.y * blockDim.y + threadIdx.y;
+        V1直接反转x和y就行了，其余保持一致
+        这种实现理论上要比上面的要好，因为不涉及到除法和求余数
+     */
+
     if (x < M && y < P) {
         scalar_t tmp = 0;
         for (uint32_t k = 0; k < N; k++) {
