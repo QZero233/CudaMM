@@ -672,27 +672,32 @@ namespace V10 {
     // 一个Warp里有 THREAD_ROW_SIZE_IN_WARP * THREAD_COL_SIZE_IN_WARP 个Thread
     constexpr uint32_t THREAD_ROW_SIZE_IN_WARP = 4;
     constexpr uint32_t THREAD_COL_SIZE_IN_WARP = 8;
-    // 所以一个Thread需要计算 (WARP_ROW_SIZE / THREAD_ROW_SIZE_IN_WARP) * (WARP_COL_SIZE / THREAD_COL_SIZE_IN_WARP) 个OUT
-    constexpr uint32_t TILE_ROW_SIZE = WARP_ROW_SIZE / THREAD_ROW_SIZE_IN_WARP;
-    constexpr uint32_t TILE_COL_SIZE = WARP_COL_SIZE / THREAD_COL_SIZE_IN_WARP;
+    // 那么每个线程需要计算
+    constexpr uint32_t THREAD_CAL_ROW_SIZE = WARP_ROW_SIZE / THREAD_ROW_SIZE_IN_WARP;
+    constexpr uint32_t THREAD_CAL_COL_SIZE = WARP_COL_SIZE / THREAD_COL_SIZE_IN_WARP;
 
+    // 每个线程计算的Tile布局为 TILE_ROW_SIZE * TILE_COL_SIZE
+    // 这里取 TILE_COL_SIZE = 4 以避免加载Bs时的Bank Conflict
+    constexpr uint32_t TILE_ROW_SIZE = 8;
+    constexpr uint32_t TILE_COL_SIZE = 4;
+
+    // 现在，如果32个线程都只计算一次Tile，那么是无法完成一个Warp所需的计算要求的，所以需要在两个方向计算多次
+    constexpr uint32_t THREAD_ROW_ITER_NUM = WARP_ROW_SIZE / (THREAD_ROW_SIZE_IN_WARP * TILE_ROW_SIZE);
+    constexpr uint32_t THREAD_COL_ITER_NUM = WARP_COL_SIZE / (THREAD_COL_SIZE_IN_WARP * TILE_COL_SIZE);
+
+    // 一次计算（即一个iter）会计算 ITER_ROW_SIZE * ITER_COL_SIZE 个OUT
+    constexpr uint32_t ITER_ROW_SIZE = TILE_ROW_SIZE * THREAD_ROW_SIZE_IN_WARP;
+    constexpr uint32_t ITER_COL_SIZE = TILE_COL_SIZE * THREAD_COL_SIZE_IN_WARP;
 
     __device__ inline uint32_t idx(uint32_t x, uint32_t y, uint32_t row_num, uint32_t col_num) {
         return x * col_num + y;
     }
 
     __global__ void MatmulKernelV10(const scalar_t *a, const scalar_t *b, scalar_t *out, uint32_t M, uint32_t N, uint32_t P) {
-        // 每个线程计算OUT的 TILE_ROW_SIZE * TILE_ROW_SIZE 个值
         const uint32_t outTopLeftX = blockIdx.x * ROW_BLOCK_SIZE;
         const uint32_t outTopLeftY = blockIdx.y * COL_BLOCK_SIZE;
 
-        // FIXME 这里判断条件要加上
-        // const uint32_t threadX = threadIdx.x / (COL_BLOCK_SIZE / TILE_COL_SIZE);
-        // const uint32_t threadY = threadIdx.x % (COL_BLOCK_SIZE / TILE_COL_SIZE);
-        //
-        // if ((outTopLeftX + threadX) >= M || (outTopLeftY + threadY) >= P) {
-        //     return;
-        // }
+        // FIXME 如果需要适配任意形状，那么这里得判断边界条件
 
         // 用lambda表达式计算二维坐标对应的下标
         const auto aIdx = [M, N](uint32_t x, uint32_t y) {
@@ -710,6 +715,9 @@ namespace V10 {
         const auto bsIdx = [](uint32_t x, uint32_t y) {
             return idx(x, y, K_STEP, COL_BLOCK_SIZE);
         };
+        const auto tmpIdx = [](uint32_t x, uint32_t y) {
+            return idx(x, y, THREAD_CAL_ROW_SIZE, THREAD_CAL_COL_SIZE);
+        };
 
         // 每个Block计算 ROW_BLOCK_SIZE * COL_BLOCK_SIZE 个OUT
         // 其中每个线程计算 TILE_ROW_SIZE * TILE_COL_SIZE 个OUT
@@ -719,21 +727,21 @@ namespace V10 {
         constexpr uint32_t strideA = (ROW_BLOCK_SIZE * K_STEP) / THREAD_NUM_PER_BLOCK;
         constexpr uint32_t strideB = (K_STEP * COL_BLOCK_SIZE) / THREAD_NUM_PER_BLOCK;
 
-        scalar_t tmp[TILE_ROW_SIZE * TILE_COL_SIZE] = {0.0f};
+        scalar_t tmp[THREAD_CAL_ROW_SIZE * THREAD_CAL_COL_SIZE] = {0.0f};
         scalar_t a_reg[TILE_ROW_SIZE];
         scalar_t b_reg[TILE_COL_SIZE];
 
+        // 一个Block里，一行有多少个Warp
         constexpr uint32_t WARP_COL_SIZE_IN_BLOCK = COL_BLOCK_SIZE / WARP_COL_SIZE;
+        // 计算当前Warp在Block中的坐标
         const uint32_t warp_index_in_block = threadIdx.x / WARP_SIZE;
         const uint32_t warp_block_x = warp_index_in_block / WARP_COL_SIZE_IN_BLOCK;
         const uint32_t warp_block_y = warp_index_in_block % WARP_COL_SIZE_IN_BLOCK;
 
+        // 计算当前线程在Warp里的坐标
         const uint32_t thread_index_in_warp = threadIdx.x % WARP_SIZE;
         const uint32_t thread_x_in_warp = thread_index_in_warp / THREAD_COL_SIZE_IN_WARP;
         const uint32_t thread_y_in_warp = thread_index_in_warp % THREAD_COL_SIZE_IN_WARP;
-
-        const uint32_t thread_x_in_block = warp_block_x * THREAD_ROW_SIZE_IN_WARP + thread_x_in_warp;
-        const uint32_t thread_y_in_block = warp_block_y * THREAD_COL_SIZE_IN_WARP + thread_y_in_warp;
 
         for (uint32_t k = 0; k < N; k += K_STEP) {
             // 使用float4向量化加载必须确保每个线程处理的元素个数是4对齐的
@@ -786,23 +794,36 @@ namespace V10 {
             __syncthreads();
 
             for (uint32_t i = 0; i < K_STEP; i++) {
-                // 这里会向量化加载a_reg，所以要求其长度4对齐
-                static_assert((TILE_ROW_SIZE & 3) == 0);
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row += 4) {
-                    reinterpret_cast<float4 *>(&a_reg[tile_row])[0] =
-                        reinterpret_cast<float4 *>(&As[asIdxTranspose(i, thread_x_in_block * TILE_ROW_SIZE + tile_row)])[0];
-                }
+                // 之前提到的，一个线程需要计算多次tile才能完成任务，所以这里得循环一波
+                for (uint32_t row_iter = 0; row_iter < THREAD_ROW_ITER_NUM; row_iter++) {
+                    for (uint32_t col_iter = 0; col_iter < THREAD_COL_ITER_NUM; col_iter++) {
+                        // 计算当前iter所需计算的tile的左上角坐标
+                        const uint32_t iter_tile_top_left_x = warp_block_x * WARP_ROW_SIZE + row_iter * ITER_ROW_SIZE + thread_x_in_warp * TILE_ROW_SIZE;
+                        const uint32_t iter_tile_top_left_y = warp_block_y * WARP_COL_SIZE + col_iter * ITER_COL_SIZE + thread_y_in_warp * TILE_COL_SIZE;
 
-                // 同理，向量化加载b_reg
-                static_assert((TILE_COL_SIZE & 3) == 0);
-                for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
-                    reinterpret_cast<float4 *>(&b_reg[tile_col])[0] =
-                        reinterpret_cast<float4 *>(&Bs[bsIdx(i, thread_y_in_block * TILE_COL_SIZE + tile_col)])[0];
-                }
+                        // 这里会向量化加载a_reg，所以要求其长度4对齐
+                        static_assert((TILE_ROW_SIZE & 3) == 0);
+                        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row += 4) {
+                            reinterpret_cast<float4 *>(&a_reg[tile_row])[0] =
+                                reinterpret_cast<float4 *>(&As[asIdxTranspose(i, iter_tile_top_left_x + tile_row)])[0];
+                        }
 
-                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-                    for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
-                        tmp[tile_row * TILE_COL_SIZE + tile_col] += a_reg[tile_row] * b_reg[tile_col];
+                        // 同理，向量化加载b_reg
+                        static_assert((TILE_COL_SIZE & 3) == 0);
+                        for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
+                            reinterpret_cast<float4 *>(&b_reg[tile_col])[0] =
+                                reinterpret_cast<float4 *>(&Bs[bsIdx(i, iter_tile_top_left_y + tile_col)])[0];
+                        }
+
+                        // 当前计算的tmp的左上角坐标
+                        const uint32_t tmp_top_left_x = row_iter * TILE_ROW_SIZE;
+                        const uint32_t tmp_top_left_y = col_iter * TILE_COL_SIZE;
+                        // 计算tmp
+                        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+                            for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
+                                tmp[tmpIdx(tmp_top_left_x + tile_row, tmp_top_left_y + tile_col)] += a_reg[tile_row] * b_reg[tile_col];
+                            }
+                        }
                     }
                 }
             }
@@ -811,15 +832,24 @@ namespace V10 {
         }
 
         // 写回结果
-        // 这个线程需要计算的小OUT块的左上角坐标
-        const uint32_t thread_out_top_left_x = outTopLeftX + thread_x_in_block * TILE_ROW_SIZE;
-        const uint32_t thread_out_top_left_y = outTopLeftY + thread_y_in_block * TILE_COL_SIZE;
-
+        // 同理，这里也要写回多个tile
         static_assert((TILE_COL_SIZE & 3) == 0);
-        for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-            for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
-                reinterpret_cast<float4 *>(&out[outIdx(thread_out_top_left_x + tile_row, thread_out_top_left_y + tile_col)])[0] =
-                    reinterpret_cast<float4 *>(&tmp[tile_row * TILE_COL_SIZE + tile_col])[0];
+        for (uint32_t row_iter = 0; row_iter < THREAD_ROW_ITER_NUM; row_iter++) {
+            for (uint32_t col_iter = 0; col_iter < THREAD_COL_ITER_NUM; col_iter++) {
+                // 计算当前iter所需写回的tile的左上角坐标
+                const uint32_t iter_tile_top_left_x = warp_block_x * WARP_ROW_SIZE + row_iter * ITER_ROW_SIZE + thread_x_in_warp * TILE_ROW_SIZE;
+                const uint32_t iter_tile_top_left_y = warp_block_y * WARP_COL_SIZE + col_iter * ITER_COL_SIZE + thread_y_in_warp * TILE_COL_SIZE;
+
+                // 当前计算的tmp的左上角坐标
+                const uint32_t tmp_top_left_x = row_iter * TILE_ROW_SIZE;
+                const uint32_t tmp_top_left_y = col_iter * TILE_COL_SIZE;
+
+                for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
+                    for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col += 4) {
+                        reinterpret_cast<float4 *>(&out[outIdx(outTopLeftX + iter_tile_top_left_x + tile_row, outTopLeftY + iter_tile_top_left_y + tile_col)])[0] =
+                            reinterpret_cast<float4 *>(&tmp[tmpIdx(tmp_top_left_x + tile_row, tmp_top_left_y + tile_col)])[0];
+                    }
+                }
             }
         }
     }
