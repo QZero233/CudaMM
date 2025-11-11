@@ -820,7 +820,7 @@ namespace V10 {
                         const uint32_t tmp_top_left_y = col_iter * TILE_COL_SIZE;
                         // 计算tmp
                         for (uint32_t tile_row = 0; tile_row < TILE_ROW_SIZE; tile_row++) {
-                            for (uint32_t tile_col = 0; tile_col < TILE_ROW_SIZE; tile_col++) {
+                            for (uint32_t tile_col = 0; tile_col < TILE_COL_SIZE; tile_col++) {
                                 tmp[tmpIdx(tmp_top_left_x + tile_row, tmp_top_left_y + tile_col)] += a_reg[tile_row] * b_reg[tile_col];
                             }
                         }

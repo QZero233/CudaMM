@@ -10,9 +10,11 @@
 #include "cuda_matmul.h"
 
 static float max_rel_error(const float *ref, const float *got, size_t elems, bool show_diff_log) {
+    assert(ref != nullptr && got != nullptr);
     float maxr = 0.0f;
     for (size_t i = 0; i < elems; ++i) {
         float a = ref[i], b = got[i];
+        assert(std::isfinite(a) && std::isfinite(b));
         float denom = std::max(std::abs(a), 1e-8f);
         float r = std::abs(a - b) / denom;
         if (r > maxr) maxr = r;
